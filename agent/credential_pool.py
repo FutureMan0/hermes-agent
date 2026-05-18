@@ -1250,11 +1250,12 @@ class CredentialPool:
         return entry
 
     def peek(self) -> Optional[PooledCredential]:
-        current = self.current()
-        if current is not None:
-            return current
-        available = self._available_entries()
-        return available[0] if available else None
+        with self._lock:
+            current = self.current()
+            if current is not None:
+                return current
+            available = self._available_entries()
+            return available[0] if available else None
 
     def mark_exhausted_and_rotate(
         self,

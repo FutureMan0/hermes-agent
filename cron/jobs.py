@@ -956,6 +956,39 @@ def advance_next_run(job_id: str) -> bool:
         return False
 
 
+def advance_next_run_batch(job_ids: List[str]) -> Dict[str, bool]:
+    """Batch-advance next_run_at for multiple recurring jobs in a single I/O cycle.
+
+    Equivalent to calling advance_next_run() for each ID, but performs only
+    one load/save round-trip instead of N.  This reduces fsync overhead when
+    many jobs become due simultaneously (e.g. gateway restart after downtime).
+
+    Returns a dict mapping each job_id → whether it was advanced.
+    """
+    results: Dict[str, bool] = {jid: False for jid in job_ids}
+    if not job_ids:
+        return results
+    with _jobs_file_lock:
+        jobs = load_jobs()
+        modified = False
+        for job in jobs:
+            jid = job["id"]
+            if jid not in results:
+                continue
+            kind = job.get("schedule", {}).get("kind")
+            if kind not in {"cron", "interval"}:
+                continue
+            now = _hermes_now().isoformat()
+            new_next = compute_next_run(job["schedule"], now)
+            if new_next and new_next != job.get("next_run_at"):
+                job["next_run_at"] = new_next
+                results[jid] = True
+                modified = True
+        if modified:
+            save_jobs(jobs)
+    return results
+
+
 def get_due_jobs() -> List[Dict[str, Any]]:
     """Get all jobs that are due to run now.
 

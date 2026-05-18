@@ -123,7 +123,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
+from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, advance_next_run_batch
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -1794,8 +1794,8 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
 
         # Advance next_run_at for all recurring jobs FIRST, under the file lock,
         # before any execution begins.  This preserves at-most-once semantics.
-        for job in due_jobs:
-            advance_next_run(job["id"])
+        # Use batch version to reduce I/O from N load/save cycles to one.
+        advance_next_run_batch([job["id"] for job in due_jobs])
 
         # Resolve max parallel workers: env var > config.yaml > unbounded.
         # Set HERMES_CRON_MAX_PARALLEL=1 to restore old serial behaviour.
