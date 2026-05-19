@@ -3334,7 +3334,39 @@ def run_conversation(
                     except Exception:
                         pass
 
-                agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+                try:
+                    agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+                except Exception as _tool_exec_err:
+                    logger.error(
+                        "Unhandled exception in _execute_tool_calls: %s",
+                        _tool_exec_err, exc_info=True,
+                    )
+                    # The assistant message with tool_calls was already appended
+                    # to messages.  The API requires a role="tool" result for
+                    # every tool_call_id — fill in error results so the
+                    # conversation state stays valid and the loop can continue.
+                    _answered_ids = {
+                        m["tool_call_id"]
+                        for m in messages
+                        if isinstance(m, dict) and m.get("role") == "tool"
+                    }
+                    for _tc in (assistant_message.tool_calls or []):
+                        _tc_id = getattr(_tc, "id", None) or (isinstance(_tc, dict) and _tc.get("id"))
+                        if _tc_id and _tc_id not in _answered_ids:
+                            _tc_name = ""
+                            _fn = getattr(_tc, "function", None)
+                            if _fn:
+                                _tc_name = getattr(_fn, "name", "")
+                            elif isinstance(_tc, dict):
+                                _fn_d = _tc.get("function")
+                                if isinstance(_fn_d, dict):
+                                    _tc_name = _fn_d.get("name", "")
+                            messages.append({
+                                "role": "tool",
+                                "name": _tc_name,
+                                "tool_call_id": _tc_id,
+                                "content": f"Error executing tool: {_tool_exec_err}",
+                            })
 
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
