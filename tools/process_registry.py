@@ -707,6 +707,17 @@ class ProcessRegistry:
                 session.process.wait(timeout=5)
             except Exception as e:
                 logger.debug("Process wait timed out or failed: %s", e)
+            # Close stdin/stdout pipes to reclaim file descriptors.
+            # Without this, the Popen object retains open FDs until the
+            # session is pruned from _finished (up to 30 min), leaking
+            # pipe buffers and contributing to EMFILE on long-running
+            # gateways.
+            for _pipe in (session.process.stdout, session.process.stdin):
+                if _pipe is not None:
+                    try:
+                        _pipe.close()
+                    except Exception:
+                        pass
             session.exited = True
             session.exit_code = session.process.returncode
             self._move_to_finished(session)
