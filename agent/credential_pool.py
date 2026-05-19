@@ -1133,6 +1133,22 @@ class CredentialPool:
 
     def select(self) -> Optional[PooledCredential]:
         with self._lock:
+            result = self._select_unlocked()
+        if result is not None:
+            return result
+        # No fresh entries available — check for stale entries that need
+        # an OAuth refresh.  Perform the refresh OUTSIDE self._lock so that
+        # concurrent credential operations (lease, rotate, peek) are not
+        # blocked for the full duration of the HTTP call.
+        stale = list(getattr(self, "_pending_refresh", []))
+        if not stale:
+            return None
+        logger.debug("credential pool: performing out-of-lock refresh for %s", stale[0].id[:8])
+        refreshed = self._refresh_entry(stale[0], force=False)
+        if refreshed is None:
+            return None
+        # Re-acquire lock and retry selection with the freshly refreshed entry.
+        with self._lock:
             return self._select_unlocked()
 
     def _available_entries(self, *, clear_expired: bool = False, refresh: bool = False) -> List[PooledCredential]:
@@ -1140,11 +1156,16 @@ class CredentialPool:
 
         When *clear_expired* is True, entries whose cooldown has elapsed are
         reset to STATUS_OK and persisted.  When *refresh* is True, entries
-        that need a token refresh are refreshed (skipped on failure).
+        that need a token refresh are collected in ``self._pending_refresh``
+        for out-of-lock refresh by the caller, and excluded from the returned
+        list.  This avoids network I/O (OAuth token refresh) inside the
+        critical section protected by ``self._lock``.
         """
         now = time.time()
         cleared_any = False
         available: List[PooledCredential] = []
+        if refresh:
+            self._pending_refresh: List[PooledCredential] = []
         for entry in self._entries:
             # For anthropic claude_code entries, sync from the credentials file
             # before any status/refresh checks. This picks up tokens refreshed
@@ -1207,10 +1228,12 @@ class CredentialPool:
                     entry = cleared
                     cleared_any = True
             if refresh and self._entry_needs_refresh(entry):
-                refreshed = self._refresh_entry(entry, force=False)
-                if refreshed is None:
-                    continue
-                entry = refreshed
+                # Defer refresh — collected in self._pending_refresh for
+                # out-of-lock execution.  Inline OAuth refreshes under
+                # self._lock block ALL concurrent credential operations
+                # for the duration of the HTTP call (potentially seconds).
+                self._pending_refresh.append(entry)
+                continue
             available.append(entry)
         if cleared_any:
             self._persist()
@@ -1278,7 +1301,18 @@ class CredentialPool:
             if next_entry:
                 _next_label = next_entry.label or next_entry.id[:8]
                 logger.info("credential pool: rotated to %s", _next_label)
-            return next_entry
+                return next_entry
+            # No fresh entries — gather stale for out-of-lock refresh.
+            stale = list(getattr(self, "_pending_refresh", []))
+        if not stale:
+            return None
+        # Refresh outside lock to avoid blocking concurrent operations.
+        logger.debug("credential pool: performing out-of-lock refresh during rotation")
+        refreshed = self._refresh_entry(stale[0], force=False)
+        if refreshed is None:
+            return None
+        with self._lock:
+            return self._select_unlocked()
 
     def acquire_lease(self, credential_id: Optional[str] = None) -> Optional[str]:
         """Acquire a soft lease on a credential.
@@ -1295,21 +1329,37 @@ class CredentialPool:
                 return credential_id
 
             available = self._available_entries(clear_expired=True, refresh=True)
+            if available:
+                return self._lease_from_available_unlocked(available)
+
+        # No fresh entries — attempt out-of-lock refresh for stale entries.
+        stale = list(getattr(self, "_pending_refresh", []))
+        if not stale:
+            return None
+        logger.debug("credential pool: performing out-of-lock refresh for lease acquisition")
+        refreshed = self._refresh_entry(stale[0], force=False)
+        if refreshed is None:
+            return None
+        with self._lock:
+            available = self._available_entries(clear_expired=True, refresh=False)
             if not available:
                 return None
+            return self._lease_from_available_unlocked(available)
 
-            below_cap = [
-                entry for entry in available
-                if self._active_leases.get(entry.id, 0) < self._max_concurrent
-            ]
-            candidates = below_cap if below_cap else available
-            chosen = min(
-                candidates,
-                key=lambda entry: (self._active_leases.get(entry.id, 0), entry.priority),
-            )
-            self._active_leases[chosen.id] = self._active_leases.get(chosen.id, 0) + 1
-            self._current_id = chosen.id
-            return chosen.id
+    def _lease_from_available_unlocked(self, available: List[PooledCredential]) -> Optional[str]:
+        """Select and lease the best available credential. Must hold self._lock."""
+        below_cap = [
+            entry for entry in available
+            if self._active_leases.get(entry.id, 0) < self._max_concurrent
+        ]
+        candidates = below_cap if below_cap else available
+        chosen = min(
+            candidates,
+            key=lambda entry: (self._active_leases.get(entry.id, 0), entry.priority),
+        )
+        self._active_leases[chosen.id] = self._active_leases.get(chosen.id, 0) + 1
+        self._current_id = chosen.id
+        return chosen.id
 
     def release_lease(self, credential_id: str) -> None:
         """Release a previously acquired credential lease."""
@@ -1321,10 +1371,21 @@ class CredentialPool:
                 self._active_leases[credential_id] = count - 1
 
     def try_refresh_current(self) -> Optional[PooledCredential]:
+        # Snapshot the current entry under lock, then refresh outside.
         with self._lock:
-            return self._try_refresh_current_unlocked()
+            entry = self.current()
+        if entry is None:
+            return None
+        # OAuth refresh involves network I/O — perform outside self._lock
+        # so concurrent credential operations are not blocked.
+        refreshed = self._refresh_entry(entry, force=True)
+        if refreshed is not None:
+            with self._lock:
+                self._current_id = refreshed.id
+        return refreshed
 
     def _try_refresh_current_unlocked(self) -> Optional[PooledCredential]:
+        """Refresh the current entry. Caller must hold self._lock."""
         entry = self.current()
         if entry is None:
             return None
