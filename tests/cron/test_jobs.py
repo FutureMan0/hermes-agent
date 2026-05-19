@@ -24,6 +24,10 @@ from cron.jobs import (
     advance_next_run,
     get_due_jobs,
     save_job_output,
+    purge_old_output,
+    _MAX_OUTPUT_CHARS,
+    _DEFAULT_OUTPUT_RETENTION_DAYS,
+    _MAX_OUTPUT_FILES_PER_JOB,
 )
 
 
@@ -953,3 +957,117 @@ class TestSaveJobOutput:
         assert output_file.exists()
         assert output_file.read_text() == "# Results\nEverything ok."
         assert "test123" in str(output_file)
+
+    def test_truncates_oversized_output(self, tmp_cron_dir):
+        """Large outputs are truncated to prevent disk exhaustion."""
+        huge_output = "X" * (_MAX_OUTPUT_CHARS + 50000)
+        output_file = save_job_output("testbig", huge_output)
+        content = output_file.read_text()
+        assert len(content) < len(huge_output), "Output should have been truncated"
+        assert "OUTPUT TRUNCATED" in content
+        assert str(_MAX_OUTPUT_CHARS) in content
+        assert str(len(huge_output)) in content
+
+    def test_small_output_not_truncated(self, tmp_cron_dir):
+        """Output within the limit is saved verbatim."""
+        small_output = "# Small report\nAll good.\n"
+        output_file = save_job_output("testsmall", small_output)
+        assert output_file.read_text() == small_output
+
+    def test_exactly_at_limit_not_truncated(self, tmp_cron_dir):
+        """Output exactly at the limit boundary is not truncated."""
+        exact_output = "A" * _MAX_OUTPUT_CHARS
+        output_file = save_job_output("testexact", exact_output)
+        assert output_file.read_text() == exact_output
+
+
+class TestPurgeOldOutput:
+    def test_removes_old_files(self, tmp_cron_dir):
+        """Files older than the retention window are purged."""
+        from cron.jobs import OUTPUT_DIR
+        import time
+
+        job_dir = OUTPUT_DIR / "oldjob"
+        job_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create a file with an old modification time
+        old_file = job_dir / "2020-01-01_00-00-00.md"
+        old_file.write_text("old output")
+        # Set mtime to far in the past
+        old_timestamp = time.time() - (_DEFAULT_OUTPUT_RETENTION_DAYS + 10) * 86400
+        import os
+        os.utime(old_file, (old_timestamp, old_timestamp))
+
+        # Create a recent file that should survive
+        recent_file = job_dir / "2099-12-31_23-59-00.md"
+        recent_file.write_text("recent output")
+
+        purge_old_output()
+
+        assert not old_file.exists(), "Old file should have been purged"
+        assert recent_file.exists(), "Recent file should survive"
+
+    def test_respects_configured_retention(self, tmp_cron_dir):
+        """Custom retention_days from config.yaml is honoured."""
+        from cron.jobs import OUTPUT_DIR
+        import time, os
+
+        job_dir = OUTPUT_DIR / "cfgjob"
+        job_dir.mkdir(parents=True, exist_ok=True)
+
+        # File 5 days old — should survive with retention=10
+        file_5d = job_dir / "file_5d.md"
+        file_5d.write_text("5 days old")
+        ts_5d = time.time() - 5 * 86400
+        os.utime(file_5d, (ts_5d, ts_5d))
+
+        # File 15 days old — should be purged with retention=10
+        file_15d = job_dir / "file_15d.md"
+        file_15d.write_text("15 days old")
+        ts_15d = time.time() - 15 * 86400
+        os.utime(file_15d, (ts_15d, ts_15d))
+
+        purge_old_output({"cron": {"output_retention_days": 10}})
+
+        assert file_5d.exists(), "5-day-old file should survive with 10-day retention"
+        assert not file_15d.exists(), "15-day-old file should be purged with 10-day retention"
+
+    def test_count_based_pruning(self, tmp_cron_dir):
+        """Excess files beyond _MAX_OUTPUT_FILES_PER_JOB are removed."""
+        from cron.jobs import OUTPUT_DIR
+
+        job_dir = OUTPUT_DIR / "frequent"
+        job_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create more files than the limit
+        for i in range(_MAX_OUTPUT_FILES_PER_JOB + 10):
+            f = job_dir / f"2025-01-{i:02d}_00-00-00.md"
+            f.write_text(f"output {i}")
+
+        purge_old_output()
+
+        remaining = list(job_dir.glob("*.md"))
+        assert len(remaining) <= _MAX_OUTPUT_FILES_PER_JOB, (
+            f"Expected at most {_MAX_OUTPUT_FILES_PER_JOB} files, got {len(remaining)}"
+        )
+
+    def test_no_output_dir_is_safe(self, tmp_cron_dir):
+        """purge_old_output is a no-op when OUTPUT_DIR doesn't exist."""
+        # OUTPUT_DIR may not exist in a fresh install — this should not crash.
+        purge_old_output()
+
+    def test_non_md_files_not_touched(self, tmp_cron_dir):
+        """Only .md files are considered for pruning."""
+        from cron.jobs import OUTPUT_DIR
+        import time, os
+
+        job_dir = OUTPUT_DIR / "mixed"
+        job_dir.mkdir(parents=True, exist_ok=True)
+
+        old_txt = job_dir / "notes.txt"
+        old_txt.write_text("user notes")
+        old_ts = time.time() - 999 * 86400
+        os.utime(old_txt, (old_ts, old_ts))
+
+        purge_old_output()
+        assert old_txt.exists(), "Non-.md files should never be touched"

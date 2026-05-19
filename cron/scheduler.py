@@ -123,7 +123,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, advance_next_run_batch
+from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, advance_next_run_batch, purge_old_output
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -1783,6 +1783,17 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
         return 0
 
     try:
+        # Best-effort purge of stale output files on every tick cycle.
+        # Keeps disk usage bounded without requiring manual cleanup.
+        try:
+            _tick_cfg = load_config() or {}
+        except Exception:
+            _tick_cfg = {}
+        try:
+            purge_old_output(_tick_cfg)
+        except Exception as _purge_exc:
+            logger.debug("Output purge failed (non-fatal): %s", _purge_exc)
+
         due_jobs = get_due_jobs()
 
         if verbose and not due_jobs:

@@ -1091,16 +1091,37 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
     return due
 
 
+# Maximum size (in characters) for a single cron job output file.
+# Outputs exceeding this are truncated with a marker so the user sees the
+# beginning and the truncation is obvious.  256 KB of text is generous for
+# cron reports while preventing runaway scripts from filling the disk.
+_MAX_OUTPUT_CHARS = 256 * 1024
+
+
 def save_job_output(job_id: str, output: str):
-    """Save job output to file."""
+    """Save job output to file.
+
+    Large outputs are truncated to ``_MAX_OUTPUT_CHARS`` to prevent disk
+    exhaustion from runaway cron jobs or scripts that produce megabytes of
+    output per tick.
+    """
     ensure_dirs()
     job_output_dir = OUTPUT_DIR / job_id
     job_output_dir.mkdir(parents=True, exist_ok=True)
     _secure_dir(job_output_dir)
-    
+
+    # Truncate oversized output with a clear marker.
+    if len(output) > _MAX_OUTPUT_CHARS:
+        truncation_notice = (
+            f"\n\n--- OUTPUT TRUNCATED at {_MAX_OUTPUT_CHARS} characters ---\n"
+            f"Original size: {len(output)} characters. "
+            f"Adjust cron config or script to reduce output.\n"
+        )
+        output = output[:_MAX_OUTPUT_CHARS] + truncation_notice
+
     timestamp = _hermes_now().strftime("%Y-%m-%d_%H-%M-%S")
     output_file = job_output_dir / f"{timestamp}.md"
-    
+
     fd, tmp_path = tempfile.mkstemp(dir=str(job_output_dir), suffix='.tmp', prefix='.output_')
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
@@ -1115,8 +1136,101 @@ def save_job_output(job_id: str, output: str):
         except OSError:
             pass
         raise
-    
+
     return output_file
+
+
+# Default retention period for cron output files (in days).
+# Files older than this are purged during tick().  Configurable via
+# ``cron.output_retention_days`` in config.yaml.
+_DEFAULT_OUTPUT_RETENTION_DAYS = 30
+
+# Maximum number of output files kept per job.  When exceeded, the oldest
+# files are removed first.  Prevents job output directories from growing
+# without bound for very frequent jobs.
+_MAX_OUTPUT_FILES_PER_JOB = 500
+
+
+def purge_old_output(cfg: Optional[Dict[str, Any]] = None):
+    """Remove stale cron output files that exceed the retention window.
+
+    Called once per ``tick()`` cycle so disk usage stays bounded without
+    requiring manual cleanup.  Two pruning strategies are applied:
+
+    1. **Time-based**: Files older than ``cron.output_retention_days`` (default
+       30) are deleted.
+    2. **Count-based**: If a job still has more than ``_MAX_OUTPUT_FILES_PER_JOB``
+       output files after time-based pruning, the oldest are removed.
+
+    Both strategies are conservative — only ``*.md`` files inside
+    ``OUTPUT_DIR/{job_id}/`` are considered, so accidental files placed by
+    users are never touched.
+    """
+    if not OUTPUT_DIR.exists():
+        return
+
+    retention_days = _DEFAULT_OUTPUT_RETENTION_DAYS
+    try:
+        cron_cfg = (cfg or {}).get("cron", {}) if isinstance(cfg, dict) else {}
+        configured = cron_cfg.get("output_retention_days")
+        if configured is not None:
+            retention_days = int(configured)
+            if retention_days < 1:
+                retention_days = _DEFAULT_OUTPUT_RETENTION_DAYS
+    except (ValueError, TypeError):
+        pass
+
+    now = _hermes_now()
+    cutoff = now - timedelta(days=retention_days)
+
+    for job_dir in OUTPUT_DIR.iterdir():
+        if not job_dir.is_dir():
+            continue
+        try:
+            _purge_job_output_dir(job_dir, cutoff)
+        except Exception as exc:
+            logger.debug(
+                "Failed to purge output dir %s: %s", job_dir, exc,
+            )
+
+
+def _purge_job_output_dir(job_dir: Path, cutoff: datetime):
+    """Purge old and excess output files from a single job output directory."""
+    # Collect *.md output files with their modification times.
+    output_files = sorted(
+        (f for f in job_dir.iterdir() if f.suffix == ".md" and f.is_file()),
+        key=lambda f: f.stat().st_mtime,
+    )
+
+    if not output_files:
+        return
+
+    removed = 0
+
+    # Time-based pruning: remove files older than the cutoff.
+    for f in list(output_files):
+        try:
+            mtime = datetime.fromtimestamp(f.stat().st_mtime, tz=cutoff.tzinfo)
+            if mtime < cutoff:
+                f.unlink()
+                output_files.remove(f)
+                removed += 1
+        except OSError:
+            pass
+
+    # Count-based pruning: keep at most _MAX_OUTPUT_FILES_PER_JOB.
+    while len(output_files) > _MAX_OUTPUT_FILES_PER_JOB:
+        oldest = output_files.pop(0)
+        try:
+            oldest.unlink()
+            removed += 1
+        except OSError:
+            pass
+
+    if removed:
+        logger.info(
+            "Purged %d old output file(s) from %s", removed, job_dir.name,
+        )
 
 
 # =============================================================================
